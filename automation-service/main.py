@@ -238,6 +238,22 @@ def order_allows_broker_access(order: dict[str, Any]) -> bool:
     return bool(product_types) and product_types.issubset({"course", "ea"})
 
 
+def order_uses_payment_team_options(order: dict[str, Any]) -> bool:
+    """Products that must never display the broker-registration button."""
+    for item in order.get("items", []):
+        if not isinstance(item, dict):
+            continue
+        product_type = str(item.get("type", "")).strip().lower().replace("-", "_")
+        product_name = " ".join(str(item.get("name", "")).strip().lower().split())
+        if product_type in {"trading_routine_ea", "indicator"}:
+            return True
+        if "thetradingroutine ea" in product_name or "the trading routine ea" in product_name:
+            return True
+        if "holly grail" in product_name:
+            return True
+    return False
+
+
 def order_is_monthly_subscription(order: dict[str, Any]) -> bool:
     return any(
         isinstance(item, dict) and str(item.get("type", "")).strip().lower() == "indicator"
@@ -266,9 +282,15 @@ def order_payment_amount(order: dict[str, Any]) -> str:
 
 
 def send_whatsapp_order_template(order: dict[str, Any]) -> str:
-    template_name = env("WHATSAPP_ORDER_TEMPLATE")
+    template_name = (
+        env("WHATSAPP_PAYMENT_TEAM_TEMPLATE", "ttr_payment_team_options")
+        if order_uses_payment_team_options(order)
+        else env("WHATSAPP_ORDER_TEMPLATE")
+    )
     if not template_name:
         raise RuntimeError("WhatsApp order template is not configured")
+    template_mode = "payment-and-team" if order_uses_payment_team_options(order) else "full-options"
+    print(f"WhatsApp order template selected: {template_name} ({template_mode})")
     response = whatsapp_graph_post({
         "to": whatsapp_recipient(order["customer"]["phone"]),
         "type": "template",
@@ -307,7 +329,15 @@ def send_owner_selection_notification(order: dict[str, Any], selected_option: st
     if not owner_phone:
         return ""
 
-    customer = order.get("customer") or {}
+    nested_customer = order.get("customer")
+    customer = nested_customer if isinstance(nested_customer, dict) else {}
+    # Older callback deployments returned these values at the order root.
+    # Accept both formats so owner notifications never lose customer details.
+    customer = {
+        "name": customer.get("name") or order.get("name") or "Not provided",
+        "email": customer.get("email") or order.get("email") or "Not provided",
+        "phone": customer.get("phone") or order.get("phone") or "Not provided",
+    }
     reference = str(order.get("order_ref") or order.get("reference") or "").strip()
     template_name = env("WHATSAPP_OWNER_SELECTION_TEMPLATE")
     if not template_name:
@@ -570,10 +600,16 @@ def process_whatsapp_webhook(payload: dict[str, Any]) -> None:
                             "A team member will contact you soon."
                         )
                     else:
-                        response_text = (
-                            "Please choose one of the options in the order message: "
-                            "Pay with Whish Money, Sign up with our broker, or Talk to the Team."
-                        )
+                        if order_uses_payment_team_options(order):
+                            response_text = (
+                                "Please choose one of the options in the order message: "
+                                "Whish Money or Talk to the Team."
+                            )
+                        else:
+                            response_text = (
+                                "Please choose one of the options in the order message: "
+                                "Whish Money, Broker Registration, or Talk to the Team."
+                            )
 
                     outgoing_id = send_whatsapp_text(customer_phone, response_text)
                     record_whatsapp_message(
@@ -729,8 +765,12 @@ def process_order_event(event: dict[str, Any]) -> None:
     if env("WHATSAPP_ORDER_TEMPLATE") and whatsapp_recipient(customer_phone):
         template_record = (
             f"Hello {order['customer']['name']}, we received order {order['reference']} "
-            f"for {order_product_names(order)}. Pay {order_payment_amount(order)} by Whish "
-            "Money, register through our broker partner when eligible, or talk to the team."
+            f"for {order_product_names(order)}. Pay {order_payment_amount(order)} by Whish Money, "
+            + (
+                "or talk to the team."
+                if order_uses_payment_team_options(order)
+                else "register through our broker partner, or talk to the team."
+            )
         )
         try:
             whatsapp_id = send_whatsapp_order_template(order)
