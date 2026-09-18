@@ -155,6 +155,29 @@ def verify_meta_signature(body: bytes, signature: str) -> None:
         raise HTTPException(status_code=401, detail="Invalid Meta webhook signature")
 
 
+def safe_meta_log_text(value: Any, limit: int = 300) -> str:
+    """Keep Meta diagnostics useful without exposing customer or secret data."""
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    text = re.sub(r"\b\+?\d{8,15}\b", "[phone-redacted]", text)
+    text = re.sub(
+        r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
+        "[email-redacted]",
+        text,
+    )
+    text = re.sub(r"(?i)bearer\s+[A-Za-z0-9._-]+", "Bearer [redacted]", text)
+    return text[:limit]
+
+
+def meta_error_summary(error: Any) -> tuple[str, str]:
+    if not isinstance(error, dict):
+        return "unknown", safe_meta_log_text(error or "Unknown Meta error")
+    code = str(error.get("code") or error.get("error_subcode") or "unknown")
+    error_data = error.get("error_data")
+    details = error_data.get("details") if isinstance(error_data, dict) else ""
+    message = error.get("message") or error.get("title") or details or "Unknown Meta error"
+    return code, safe_meta_log_text(message)
+
+
 def whatsapp_graph_post(payload: dict[str, Any]) -> dict[str, Any]:
     phone_number_id = env("WHATSAPP_PHONE_NUMBER_ID")
     token = env("WHATSAPP_ACCESS_TOKEN")
@@ -166,8 +189,21 @@ def whatsapp_graph_post(payload: dict[str, Any]) -> dict[str, Any]:
             json={"messaging_product": "whatsapp", **payload},
             headers={"Authorization": f"Bearer {token}"},
         )
+        print(f"WhatsApp send API response: HTTP {response.status_code}")
+        try:
+            response_data = response.json()
+        except (ValueError, json.JSONDecodeError):
+            response_data = {}
+        if response.status_code < 200 or response.status_code >= 300:
+            code, message = meta_error_summary(response_data.get("error"))
+            print(f"WhatsApp send API failed: Meta code={code}; message={message}")
         response.raise_for_status()
-        return response.json()
+        message_id = whatsapp_message_id(response_data)
+        print(
+            "WhatsApp send API accepted: "
+            f"wamid={message_id if message_id else '[not-returned]'}"
+        )
+        return response_data
 
 
 def whatsapp_message_id(response: dict[str, Any]) -> str:
@@ -521,6 +557,28 @@ def process_whatsapp_webhook(payload: dict[str, Any]) -> None:
         for change in entry.get("changes", []):
             value = change.get("value") or {}
             business_number = str((value.get("metadata") or {}).get("display_phone_number", ""))
+            for status_event in value.get("statuses", []):
+                if not isinstance(status_event, dict):
+                    continue
+                message_id = str(status_event.get("id") or "[not-provided]")
+                delivery_status = str(status_event.get("status") or "unknown").lower()
+                print(
+                    "WhatsApp webhook status: "
+                    f"wamid={message_id}; status={delivery_status}"
+                )
+                if delivery_status == "failed":
+                    errors = status_event.get("errors") or []
+                    if not errors:
+                        print(
+                            "WhatsApp webhook failure: "
+                            f"wamid={message_id}; Meta code=unknown; message=No error details returned"
+                        )
+                    for error in errors:
+                        code, message = meta_error_summary(error)
+                        print(
+                            "WhatsApp webhook failure: "
+                            f"wamid={message_id}; Meta code={code}; message={message}"
+                        )
             for message in value.get("messages", []):
                 customer_phone = str(message.get("from", ""))
                 message_id = str(message.get("id", ""))
@@ -597,7 +655,7 @@ def process_whatsapp_webhook(payload: dict[str, Any]) -> None:
                         response_text = (
                             order_context
                             + "Thank you. Your request has been sent to *The Trading Routine* team. "
-                            "A team member will contact you soon."
+                            "A team member will contact you shortly."
                         )
                     else:
                         if order_uses_payment_team_options(order):
@@ -608,7 +666,7 @@ def process_whatsapp_webhook(payload: dict[str, Any]) -> None:
                         else:
                             response_text = (
                                 "Please choose one of the options in the order message: "
-                                "Whish Money, Broker Registration, or Talk to the Team."
+                                "Broker Registration, Whish Money, or Talk to the Team."
                             )
 
                     outgoing_id = send_whatsapp_text(customer_phone, response_text)
@@ -685,13 +743,19 @@ async def send_phone_verification_code(
         status = error.response.status_code
         try:
             meta_error = error.response.json().get("error", {})
-            detail = str(meta_error.get("message") or "WhatsApp rejected the verification message")
         except (ValueError, AttributeError):
-            detail = "WhatsApp rejected the verification message"
-        print(f"WhatsApp OTP rejected: HTTP {status}: {detail}")
-        raise HTTPException(status_code=502, detail=detail) from error
+            meta_error = {}
+        meta_code, safe_message = meta_error_summary(meta_error)
+        print(
+            "WhatsApp OTP rejected: "
+            f"HTTP {status}; Meta code={meta_code}; message={safe_message}"
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="WhatsApp rejected the verification message",
+        ) from error
     except (httpx.HTTPError, RuntimeError) as error:
-        print(f"WhatsApp OTP delivery error: {type(error).__name__}: {error}")
+        print(f"WhatsApp OTP delivery error: {type(error).__name__}")
         raise HTTPException(status_code=502, detail="WhatsApp OTP delivery failed") from error
     return {"success": True, "message_id": message_id}
 
