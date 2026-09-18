@@ -178,6 +178,72 @@ def meta_error_summary(error: Any) -> tuple[str, str]:
     return code, safe_meta_log_text(message)
 
 
+def log_whatsapp_webhook_diagnostics(payload: Any) -> None:
+    """Log only webhook structure and delivery metadata, never message data."""
+    if not isinstance(payload, dict):
+        print("WhatsApp webhook received: object=unknown; valid_object=false")
+        return
+
+    object_type = safe_meta_log_text(payload.get("object") or "unknown", 80)
+    entries = payload.get("entry")
+    entries = entries if isinstance(entries, list) else []
+    print(f"WhatsApp webhook received: object={object_type}; entries={len(entries)}")
+
+    change_found = False
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        changes = entry.get("changes")
+        changes = changes if isinstance(changes, list) else []
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+            change_found = True
+            field = safe_meta_log_text(change.get("field") or "unknown", 80)
+            value = change.get("value")
+            value = value if isinstance(value, dict) else {}
+            statuses = value.get("statuses")
+            statuses = statuses if isinstance(statuses, list) else []
+            messages = value.get("messages")
+            messages = messages if isinstance(messages, list) else []
+            print(
+                "WhatsApp webhook change: "
+                f"field={field}; has_statuses={bool(statuses)}; "
+                f"has_messages={bool(messages)}"
+            )
+
+            for status_event in statuses:
+                if not isinstance(status_event, dict):
+                    continue
+                message_id = str(status_event.get("id") or "[not-provided]")
+                delivery_status = safe_meta_log_text(
+                    status_event.get("status") or "unknown", 40
+                ).lower()
+                print(
+                    "WhatsApp webhook status: "
+                    f"wamid={message_id}; status={delivery_status}"
+                )
+                if delivery_status != "failed":
+                    continue
+                errors = status_event.get("errors")
+                errors = errors if isinstance(errors, list) else []
+                if not errors:
+                    print(
+                        "WhatsApp webhook failure: "
+                        f"wamid={message_id}; Meta code=unknown; "
+                        "message=No error details returned"
+                    )
+                for error in errors:
+                    code, message = meta_error_summary(error)
+                    print(
+                        "WhatsApp webhook failure: "
+                        f"wamid={message_id}; Meta code={code}; message={message}"
+                    )
+
+    if not change_found:
+        print("WhatsApp webhook change: none")
+
+
 def whatsapp_graph_post(payload: dict[str, Any]) -> dict[str, Any]:
     phone_number_id = env("WHATSAPP_PHONE_NUMBER_ID")
     token = env("WHATSAPP_ACCESS_TOKEN")
@@ -548,6 +614,7 @@ async def receive_whatsapp_webhook(
     body = await request.body()
     verify_meta_signature(body, x_hub_signature_256)
     payload = json.loads(body)
+    log_whatsapp_webhook_diagnostics(payload)
     background_tasks.add_task(process_whatsapp_webhook, payload)
     return {"status": "accepted"}
 
@@ -557,28 +624,6 @@ def process_whatsapp_webhook(payload: dict[str, Any]) -> None:
         for change in entry.get("changes", []):
             value = change.get("value") or {}
             business_number = str((value.get("metadata") or {}).get("display_phone_number", ""))
-            for status_event in value.get("statuses", []):
-                if not isinstance(status_event, dict):
-                    continue
-                message_id = str(status_event.get("id") or "[not-provided]")
-                delivery_status = str(status_event.get("status") or "unknown").lower()
-                print(
-                    "WhatsApp webhook status: "
-                    f"wamid={message_id}; status={delivery_status}"
-                )
-                if delivery_status == "failed":
-                    errors = status_event.get("errors") or []
-                    if not errors:
-                        print(
-                            "WhatsApp webhook failure: "
-                            f"wamid={message_id}; Meta code=unknown; message=No error details returned"
-                        )
-                    for error in errors:
-                        code, message = meta_error_summary(error)
-                        print(
-                            "WhatsApp webhook failure: "
-                            f"wamid={message_id}; Meta code={code}; message={message}"
-                        )
             for message in value.get("messages", []):
                 customer_phone = str(message.get("from", ""))
                 message_id = str(message.get("id", ""))
