@@ -178,18 +178,12 @@ def meta_error_summary(error: Any) -> tuple[str, str]:
     return code, safe_meta_log_text(message)
 
 
-def log_whatsapp_webhook_diagnostics(payload: Any) -> None:
-    """Log only webhook structure and delivery metadata, never message data."""
+def log_whatsapp_webhook_failures(payload: Any) -> None:
+    """Log only failed WhatsApp delivery statuses with sanitized metadata."""
     if not isinstance(payload, dict):
-        print("WhatsApp webhook received: object=unknown; valid_object=false")
         return
-
-    object_type = safe_meta_log_text(payload.get("object") or "unknown", 80)
     entries = payload.get("entry")
     entries = entries if isinstance(entries, list) else []
-    print(f"WhatsApp webhook received: object={object_type}; entries={len(entries)}")
-
-    change_found = False
     for entry in entries:
         if not isinstance(entry, dict):
             continue
@@ -198,33 +192,19 @@ def log_whatsapp_webhook_diagnostics(payload: Any) -> None:
         for change in changes:
             if not isinstance(change, dict):
                 continue
-            change_found = True
-            field = safe_meta_log_text(change.get("field") or "unknown", 80)
             value = change.get("value")
             value = value if isinstance(value, dict) else {}
             statuses = value.get("statuses")
             statuses = statuses if isinstance(statuses, list) else []
-            messages = value.get("messages")
-            messages = messages if isinstance(messages, list) else []
-            print(
-                "WhatsApp webhook change: "
-                f"field={field}; has_statuses={bool(statuses)}; "
-                f"has_messages={bool(messages)}"
-            )
-
             for status_event in statuses:
                 if not isinstance(status_event, dict):
                     continue
-                message_id = str(status_event.get("id") or "[not-provided]")
                 delivery_status = safe_meta_log_text(
                     status_event.get("status") or "unknown", 40
                 ).lower()
-                print(
-                    "WhatsApp webhook status: "
-                    f"wamid={message_id}; status={delivery_status}"
-                )
                 if delivery_status != "failed":
                     continue
+                message_id = str(status_event.get("id") or "[not-provided]")
                 errors = status_event.get("errors")
                 errors = errors if isinstance(errors, list) else []
                 if not errors:
@@ -240,9 +220,6 @@ def log_whatsapp_webhook_diagnostics(payload: Any) -> None:
                         f"wamid={message_id}; Meta code={code}; message={message}"
                     )
 
-    if not change_found:
-        print("WhatsApp webhook change: none")
-
 
 def whatsapp_graph_post(payload: dict[str, Any]) -> dict[str, Any]:
     phone_number_id = env("WHATSAPP_PHONE_NUMBER_ID")
@@ -255,20 +232,17 @@ def whatsapp_graph_post(payload: dict[str, Any]) -> dict[str, Any]:
             json={"messaging_product": "whatsapp", **payload},
             headers={"Authorization": f"Bearer {token}"},
         )
-        print(f"WhatsApp send API response: HTTP {response.status_code}")
         try:
             response_data = response.json()
         except (ValueError, json.JSONDecodeError):
             response_data = {}
         if response.status_code < 200 or response.status_code >= 300:
             code, message = meta_error_summary(response_data.get("error"))
-            print(f"WhatsApp send API failed: Meta code={code}; message={message}")
+            print(
+                "WhatsApp send API failed: "
+                f"HTTP {response.status_code}; Meta code={code}; message={message}"
+            )
         response.raise_for_status()
-        message_id = whatsapp_message_id(response_data)
-        print(
-            "WhatsApp send API accepted: "
-            f"wamid={message_id if message_id else '[not-returned]'}"
-        )
         return response_data
 
 
@@ -614,7 +588,7 @@ async def receive_whatsapp_webhook(
     body = await request.body()
     verify_meta_signature(body, x_hub_signature_256)
     payload = json.loads(body)
-    log_whatsapp_webhook_diagnostics(payload)
+    log_whatsapp_webhook_failures(payload)
     background_tasks.add_task(process_whatsapp_webhook, payload)
     return {"status": "accepted"}
 
