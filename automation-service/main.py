@@ -677,16 +677,10 @@ def process_whatsapp_webhook(payload: dict[str, Any]) -> None:
                             "A team member will contact you shortly."
                         )
                     else:
-                        if order_uses_payment_team_options(order):
-                            response_text = (
-                                "Please choose one of the options in the order message: "
-                                "Whish Money or Talk to the Team."
-                            )
-                        else:
-                            response_text = (
-                                "Please choose one of the options in the order message: "
-                                "Broker Registration, Whish Money, or Talk to the Team."
-                            )
+                        # Keep ordinary customer messages in the order conversation,
+                        # but do not send an unsolicited options reminder. Automated
+                        # replies are reserved for recognized order-option selections.
+                        continue
 
                     outgoing_id = send_whatsapp_text(customer_phone, response_text)
                     record_whatsapp_message(
